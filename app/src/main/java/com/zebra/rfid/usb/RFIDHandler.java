@@ -11,6 +11,7 @@ import com.zebra.rfid.api3.ENUM_TRANSPORT;
 import com.zebra.rfid.api3.InvalidUsageException;
 import com.zebra.rfid.api3.OperationFailureException;
 import com.zebra.rfid.api3.RFIDReader;
+import com.zebra.rfid.api3.RFIDResults;
 import com.zebra.rfid.api3.ReaderDevice;
 import com.zebra.rfid.api3.Readers;
 import com.zebra.rfid.api3.RfidEventsListener;
@@ -54,6 +55,15 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
      * case, otherwise the reader can end up half-connected / unresponsive.
      */
     private static final long SLOW_CONNECT_THRESHOLD_MS = 1000L;
+
+    /**
+     * A slow-connect {@code reconnect()} can transiently fail with
+     * {@code RFID_COMM_OPEN_ERROR} while the USB serial channel is still busy
+     * tearing down the stale session. Retry a few times with a short backoff
+     * before giving up.
+     */
+    private static final int MAX_RECONNECT_RETRIES = 3;
+    private static final long RECONNECT_RETRY_DELAY_MS = 200L;
 
     private Readers readers;
     private ArrayList<ReaderDevice> availableReaders;
@@ -272,10 +282,7 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                 Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
                         + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
                 notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
-                long reStart = System.currentTimeMillis();
-                reader.reconnect();
-                long reElapsed = System.currentTimeMillis() - reStart;
-                Log.d(TAG, "STEP: Reader Reconnected in " + reElapsed + "ms");
+                reconnectToStabilize();
             }
             configureReader();
             if (reader.isConnected()) {
@@ -288,6 +295,46 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             return "RFID connection failed: " + e.getResults();
         }
         return "";
+    }
+
+    /**
+     * Reconnect the reader to stabilize a slow connection, retrying on the
+     * transient {@code RFID_COMM_OPEN_ERROR} that can occur while the USB
+     * serial channel is still releasing the previous session.
+     */
+    private void reconnectToStabilize() throws InvalidUsageException {
+        for (int attempt = 1; attempt <= MAX_RECONNECT_RETRIES; attempt++) {
+            try {
+                long reStart = System.currentTimeMillis();
+                reader.reconnect();
+                long reElapsed = System.currentTimeMillis() - reStart;
+                Log.d(TAG, "STEP: Reader Reconnected in " + reElapsed + "ms (attempt "
+                        + attempt + ")");
+                return;
+            } catch (OperationFailureException e) {
+                boolean commOpenError = e.getResults() == RFIDResults.RFID_COMM_OPEN_ERROR;
+                if (commOpenError && attempt < MAX_RECONNECT_RETRIES) {
+                    Log.d(TAG, "STEP: reconnect attempt " + attempt
+                            + " failed with RFID_COMM_OPEN_ERROR; retrying");
+                    notifyStatus("Reconnect attempt " + attempt
+                            + " failed (COMM_OPEN_ERROR) - retrying");
+                    sleepQuietly(RECONNECT_RETRY_DELAY_MS);
+                } else {
+                    Log.e(TAG, "STEP: reconnect failed after " + attempt
+                            + " attempt(s): " + e.getResults());
+                    e.printStackTrace();
+                    return;
+                }
+            }
+        }
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private void configureReader() {
