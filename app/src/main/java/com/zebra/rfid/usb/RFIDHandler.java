@@ -47,6 +47,14 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     private static final String TAG = "MYUSB_RFID";
     private static final int MAX_DISCOVERY_RETRIES = 3;
 
+    /**
+     * A first {@code reader.connect()} that takes longer than this indicates a
+     * stale session left over from a previous connection. The Zebra SDK
+     * recommends issuing a {@code reconnect()} to stabilize the link in that
+     * case, otherwise the reader can end up half-connected / unresponsive.
+     */
+    private static final long SLOW_CONNECT_THRESHOLD_MS = 1000L;
+
     private Readers readers;
     private ArrayList<ReaderDevice> availableReaders;
     private RFIDReader reader;
@@ -258,6 +266,17 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             reader.connect();
             long elapsed = System.currentTimeMillis() - start;
             Log.d(TAG, "STEP: Reader Connected in " + elapsed + "ms");
+            // A slow first connect means a stale session from a prior connection;
+            // reconnect once to stabilize the link before configuring it.
+            if (elapsed > SLOW_CONNECT_THRESHOLD_MS && reader.isConnected()) {
+                Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
+                        + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
+                notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
+                long reStart = System.currentTimeMillis();
+                reader.reconnect();
+                long reElapsed = System.currentTimeMillis() - reStart;
+                Log.d(TAG, "STEP: Reader Reconnected in " + reElapsed + "ms");
+            }
             configureReader();
             if (reader.isConnected()) {
                 return "RFID Connected: " + reader.getHostName() + " (" + elapsed + " ms)";
