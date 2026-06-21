@@ -391,10 +391,12 @@ onCreate()
 onReceive(ATTACHED)             [mUsbReceiver]
     └── runOnUiThread → mAttachCount++ → updateCountersUI()
                       → refreshDeviceInfo() → updateStatusUI(1)  [green]
+    └── if VID == RFID_VID → mRfidHandler.onUsbAttached()  [init SDK + connect]
 
 onReceive(DETACHED)             [mUsbReceiver]
     └── runOnUiThread → mDetachCount++ → updateCountersUI()
                       → refreshDeviceInfo() → updateStatusUI(0)  [gray]
+    └── mRfidHandler.onUsbDetached()                      [disconnect + cleanup]
 
 onReceive(USB_STATE)            [mBatteryReceiver]
     └── updateUsbModeFromIntent(intent, "broadcast")  → appendLog(summary)
@@ -408,6 +410,7 @@ onReceive(POWER_DISCONNECTED)   [mBatteryReceiver]
 onDestroy()
     └── unregisterReceiver(mUsbReceiver)
     └── unregisterReceiver(mBatteryReceiver)
+    └── mRfidHandler.onDestroy()                          [dispose SDK + executor]
 ```
 
 ---
@@ -426,4 +429,119 @@ ACTION_POWER_CONNECTED mode=File Transfer / Debug, connected=true, configured=tr
 
 USB Client action: android.intent.action.ACTION_POWER_DISCONNECTED
 ACTION_POWER_DISCONNECTED
+```
+
+---
+
+## 10. RFID SDK Integration (`RFIDHandler`)
+
+The app drives the **Zebra RFID API3 SDK** (`com.zebra.rfid.api3.*`) directly from the
+USB attach/detach events handled by `mUsbReceiver`. A dedicated `RFIDHandler` owns the
+reader lifecycle so `MainActivity` only forwards two events plus teardown.
+
+### 10.1 Trigger points
+
+| USB Event | `MainActivity` wiring | `RFIDHandler` behavior |
+|---|---|---|
+| `USB_DEVICE_ATTACHED` (VID `1504`) | `mRfidHandler.onUsbAttached()` | `initSdk()` → `createInstanceAndConnect()` → `connectReader()` → `configureReader()` |
+| `USB_DEVICE_DETACHED` | `mRfidHandler.onUsbDetached()` | `disconnect()` (remove listeners, `reader.disconnect()`, null out reader) |
+| Activity `onDestroy()` | `mRfidHandler.onDestroy()` | `dispose()` (disconnect + `readers.Dispose()` + executor shutdown) |
+
+The attach branch is gated on `finalVid == RFID_VID` so unrelated USB peripherals do
+not trigger an RFID connect attempt.
+
+### 10.2 SDK dependency
+
+The Zebra RFID API3 SDK is a **proprietary `.aar`** that is not bundled in this repo.
+It must be placed in `app/libs/`, and is pulled in by `app/build.gradle`:
+
+```gradle
+dependencies {
+    // Zebra RFID API3 SDK — drop the vendor .aar/.jar files into app/libs/.
+    implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])
+    // ...
+}
+```
+
+Required Bluetooth permissions and the USB host feature are already declared in
+`AndroidManifest.xml`.
+
+### 10.3 Initialize + connect (attach)
+
+```java
+void onUsbAttached() {
+    resumeRequested = true;
+    if (isReaderConnected()) return;
+    initSdk();                          // background: new Readers(ctx, ENUM_TRANSPORT.ALL)
+}
+
+private void createInstanceAndConnect() {
+    readers = new Readers(appContext, ENUM_TRANSPORT.ALL);
+    availableReaders = readers.GetAvailableRFIDReaderList();
+    if (availableReaders == null || availableReaders.isEmpty()) {
+        scheduleDiscoveryRetry(0);      // retry via ENUM_TRANSPORT.RE_USB (up to 3x)
+        return;
+    }
+    if (resumeRequested) connectReader();
+}
+
+private synchronized String connect() {
+    reader.connect();
+    configureReader();                  // addEventsListener + enable handheld/tag events
+    return "RFID Connected: " + reader.getHostName();
+}
+```
+
+### 10.4 Disconnect + cleanup (detach)
+
+```java
+void onUsbDetached() {
+    resumeRequested = false;
+    connectionInProgress = false;
+    disconnect();
+}
+
+private synchronized void disconnect() {
+    if (reader != null) {
+        if (eventHandler != null) reader.Events.removeEventsListener(eventHandler);
+        reader.disconnect();
+        reader = null;
+    }
+    readersAttached = false;            // re-attach on next connect
+}
+```
+
+### 10.5 Concurrency model
+
+All SDK calls run on a single-threaded background executor; UI/status messages are
+posted back to the main thread through a `StatusListener` that appends to the event
+log with a `[RFID]` prefix. `volatile` guards prevent duplicate init/connect races:
+
+| Guard | Purpose |
+|---|---|
+| `initializationInProgress` | One SDK init at a time |
+| `connectionInProgress` | One connect attempt at a time |
+| `resumeRequested` | Connect only while the sled is attached |
+| `readersAttached` | Tracks the `Readers.attach(this)` subscription |
+
+### 10.6 SDK reader events
+
+`RFIDHandler` implements `Readers.RFIDReaderEventHandler` and registers an
+`RfidEventsListener`:
+
+- `RFIDReaderAppeared` → connect if `resumeRequested`
+- `RFIDReaderDisappeared` → `disconnect()`
+- `eventReadNotify` → log tag ID + RSSI
+- `eventStatusNotify(DISCONNECTION_EVENT)` → `disconnect()`
+
+### 10.7 RFID log messages
+
+RFID lifecycle events are logged under the `MYUSB_RFID` tag and mirrored to the
+in-app event log:
+
+```
+[RFID] Initializing RFID SDK...
+[RFID] RFID Connected: RFD4031-G00B700-E8 (842 ms)
+[RFID] Tag read: E280689400004003... (RSSI -52)
+[RFID] RFID Disconnected
 ```

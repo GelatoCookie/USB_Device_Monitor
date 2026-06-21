@@ -8,7 +8,8 @@ An Android app that monitors USB device attach/detach events for the **Zebra RFD
 - **Device details** — shows Device Count, Vendor ID (VID `1504`), Product ID (PID), and device path on connect
 - **USB transport & power monitoring** — decodes the active USB mode (Power-Only / Charging vs. File Transfer / Debug) from `USB_STATE` and power connect/disconnect broadcasts
 - **Interface-change counters** — running totals of USB **attach**, **detach**, and combined **total** events for the current session
-- **Event log** — timestamped scrollable log of all USB attach/detach, transport, and power events
+- **Automatic RFID reader control** — on RFD40 attach the app initializes the Zebra RFID SDK and connects the reader; on detach it disconnects and cleans up
+- **Event log** — timestamped scrollable log of all USB attach/detach, transport, power, and RFID reader events
 - **Wake hint** — prompts user to *"Hold RFD40 trigger to wake up RFID Reader"* when in sleep mode
 - **Toast notifications** on each attach/detach event
 
@@ -23,13 +24,16 @@ An Android app that monitors USB device attach/detach events for the **Zebra RFD
 - Android **API 34+** (Android 14)
 - Zebra RFD40 RFID Sled (VID `1504`, PID `5889`)
 - USB Host mode enabled on the Android device
+- **Zebra RFID API3 SDK** `.aar` placed in `app/libs/` (proprietary — see [app/libs/README.md](app/libs/README.md))
 
 ## Project Structure
 
 ```
 app/src/main/
 ├── java/com/zebra/rfid/usb/
-│   └── MainActivity.java          # USB BroadcastReceiver + UI logic
+│   ├── MainActivity.java          # USB BroadcastReceiver + UI logic
+│   └── RFIDHandler.java           # Zebra RFID SDK lifecycle (init/connect/disconnect)
+├── libs/                          # Zebra RFID API3 SDK .aar goes here
 ├── res/
 │   ├── layout/activity_main.xml   # Material card-based UI
 │   └── drawable/
@@ -96,6 +100,22 @@ The app maintains session counters for USB interface changes, shown in the **USB
 | **Total** | `attach + detach` (derived) | blue |
 
 Each increment is also appended to the event log (`Attach count = N` / `Detach count = N`). Counters are session-scoped — they start at `0` on launch and are not persisted across activity recreation.
+
+## RFID SDK Integration
+
+When the Zebra RFD40 sled is attached/detached, `MainActivity` drives the Zebra RFID API3 SDK through a dedicated `RFIDHandler`:
+
+| USB Event | `RFIDHandler` call | Action |
+|---|---|---|
+| `USB_DEVICE_ATTACHED` (VID `1504`) | `onUsbAttached()` | Initialize SDK → enumerate readers → connect → configure event listeners |
+| `USB_DEVICE_DETACHED` | `onUsbDetached()` | Remove listeners → disconnect reader → release reader state |
+| `onDestroy()` | `onDestroy()` | Dispose SDK + shut down background executor |
+
+Reader status (connecting, connected, disconnected, tag reads, errors) is routed back into the event log with a `[RFID]` prefix via a `StatusListener` callback. SDK work runs on a single-threaded background executor with `volatile` guards (`initializationInProgress`, `connectionInProgress`, `resumeRequested`, `readersAttached`) to avoid duplicate init/connect races.
+
+> **SDK requirement:** the proprietary Zebra RFID API3 `.aar` is **not** bundled in this repository. Drop it into `app/libs/` (see [app/libs/README.md](app/libs/README.md)). `app/build.gradle` pulls it in via `implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])`. Until present, the `com.zebra.rfid.api3.*` symbols in `RFIDHandler.java` will not resolve and the project will not build.
+
+See [USB_ATTACH_DETACH_DESIGN.md](USB_ATTACH_DETACH_DESIGN.md) §10 for the full integration design.
 
 ## Key Log Tags
 

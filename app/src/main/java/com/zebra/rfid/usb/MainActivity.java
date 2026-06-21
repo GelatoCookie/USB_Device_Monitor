@@ -55,6 +55,9 @@ public class MainActivity extends AppCompatActivity {
     /* USB system service */
     private UsbManager mUsbManager;
 
+    /* Zebra RFID SDK lifecycle handler */
+    private RFIDHandler mRfidHandler;
+
     /* UI elements */
     private TextView mTvDeviceCount;
     private TextView mTvVid;
@@ -97,6 +100,10 @@ public class MainActivity extends AppCompatActivity {
         mTvStatusHint     = findViewById(R.id.tv_status_hint);
 
         mUsbManager = getSystemService(UsbManager.class);
+
+        // Route RFID reader status messages into the event log.
+        mRfidHandler = new RFIDHandler();
+        mRfidHandler.onCreate(this, status -> appendLog("[RFID] " + status));
 
         HashMap<String, UsbDevice> deviceList = mUsbManager.getDeviceList();
         int count = deviceList.size();
@@ -146,6 +153,9 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
         unregisterReceiver(mUsbReceiver);
         unregisterReceiver(mBatteryReceiver);
+        if (mRfidHandler != null) {
+            mRfidHandler.onDestroy();
+        }
     }
 
     private void updateStatusUI(int deviceCount) {
@@ -334,6 +344,11 @@ public class MainActivity extends AppCompatActivity {
                     refreshDeviceInfo();
                     makeText(MainActivity.this, "ACTION_USB_DEVICE_DETACHED", LENGTH_SHORT).show();
                 });
+
+                // USB detached -> disconnect the RFID reader and clean up.
+                if (mRfidHandler != null) {
+                    mRfidHandler.onUsbDetached();
+                }
             }
 
             if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
@@ -367,6 +382,11 @@ public class MainActivity extends AppCompatActivity {
                     if (finalVid == RFID_VID)
                         makeText(MainActivity.this, "SLED_ZEBRA_ATTACHED VID=" + RFID_VID, LENGTH_SHORT).show();
                 });
+
+                // Zebra RFID sled attached -> initialize the SDK and connect.
+                if (finalVid == RFID_VID && mRfidHandler != null) {
+                    mRfidHandler.onUsbAttached();
+                }
             }
         }
     };
