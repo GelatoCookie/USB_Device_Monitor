@@ -3,11 +3,15 @@ package com.zebra.rfid.usb;
 import static android.widget.Toast.LENGTH_SHORT;
 import static android.widget.Toast.makeText;
 
+import android.Manifest;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Bundle;
 
 import androidx.activity.EdgeToEdge;
+import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.graphics.Insets;
 import androidx.core.view.ViewCompat;
@@ -23,8 +27,10 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 
 
@@ -51,6 +57,9 @@ public class MainActivity extends AppCompatActivity {
     /* USB interface change counters */
     private int mAttachCount = 0;
     private int mDetachCount = 0;
+
+    /* Runtime Bluetooth permission request (Zebra RFID SDK enumerates bonded devices) */
+    private static final int REQ_BT_PERMISSIONS = 1001;
 
     /* USB system service */
     private UsbManager mUsbManager;
@@ -105,6 +114,10 @@ public class MainActivity extends AppCompatActivity {
         mRfidHandler = new RFIDHandler();
         mRfidHandler.onCreate(this, status -> appendLog("[RFID] " + status));
 
+        // The Zebra RFID SDK queries bonded Bluetooth devices on init, which
+        // requires the runtime BLUETOOTH_CONNECT/SCAN permissions on API 31+.
+        ensureBluetoothPermissions();
+
         HashMap<String, UsbDevice> deviceList = mUsbManager.getDeviceList();
         int count = deviceList.size();
         Log.d(TAG, "Device List Size: " + count);
@@ -155,6 +168,44 @@ public class MainActivity extends AppCompatActivity {
         unregisterReceiver(mBatteryReceiver);
         if (mRfidHandler != null) {
             mRfidHandler.onDestroy();
+        }
+    }
+
+    /** Requests the runtime Bluetooth permissions the RFID SDK needs on API 31+. */
+    private void ensureBluetoothPermissions() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return;
+        }
+        List<String> needed = new ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.BLUETOOTH_CONNECT);
+        }
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN)
+                != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.BLUETOOTH_SCAN);
+        }
+        if (!needed.isEmpty()) {
+            appendLog("Requesting Bluetooth permissions for RFID SDK...");
+            requestPermissions(needed.toArray(new String[0]), REQ_BT_PERMISSIONS);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_BT_PERMISSIONS) {
+            boolean allGranted = grantResults.length > 0;
+            for (int result : grantResults) {
+                if (result != PackageManager.PERMISSION_GRANTED) {
+                    allGranted = false;
+                    break;
+                }
+            }
+            appendLog(allGranted
+                    ? "Bluetooth permissions granted"
+                    : "Bluetooth permissions denied - RFID connect may fail");
         }
     }
 

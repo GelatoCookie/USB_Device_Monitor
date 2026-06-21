@@ -138,6 +138,14 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             readersAttached = false;
             notifyStatus("Failed to enumerate RFID readers: " + e.getInfo());
             return;
+        } catch (RuntimeException e) {
+            // e.g. SecurityException when BLUETOOTH_CONNECT is not granted.
+            e.printStackTrace();
+            initializationInProgress = false;
+            readers = null;
+            readersAttached = false;
+            notifyStatus("RFID init error: " + e.getMessage());
+            return;
         }
         initializationInProgress = false;
         if (resumeRequested) {
@@ -171,6 +179,13 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             } catch (InvalidUsageException e) {
                 e.printStackTrace();
                 scheduleDiscoveryRetry(attempt + 1);
+            } catch (RuntimeException e) {
+                // e.g. SecurityException when BLUETOOTH_CONNECT is not granted.
+                e.printStackTrace();
+                initializationInProgress = false;
+                readers = null;
+                readersAttached = false;
+                notifyStatus("RFID discovery error: " + e.getMessage());
             }
         });
     }
@@ -215,6 +230,10 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             Log.d(TAG, "Selected reader: " + list.get(0).getName());
         } catch (InvalidUsageException e) {
             e.printStackTrace();
+        } catch (RuntimeException e) {
+            // e.g. SecurityException when BLUETOOTH_CONNECT is not granted.
+            e.printStackTrace();
+            notifyStatus("RFID reader lookup error: " + e.getMessage());
         }
     }
 
