@@ -206,7 +206,24 @@ public class MainActivity extends AppCompatActivity {
             appendLog(allGranted
                     ? "Bluetooth permissions granted"
                     : "Bluetooth permissions denied - RFID connect may fail");
+
+            // If the RFD40 sled is already attached, connect now that we have
+            // the permission (no need to re-plug the device).
+            if (allGranted && mRfidHandler != null && isRfidSledAttached()) {
+                appendLog("RFD40 already attached - connecting RFID reader");
+                mRfidHandler.onUsbAttached();
+            }
         }
+    }
+
+    /** Returns true if a Zebra RFID sled (VID 1504) is currently on the USB bus. */
+    private boolean isRfidSledAttached() {
+        for (UsbDevice device : mUsbManager.getDeviceList().values()) {
+            if (device.getVendorId() == RFID_VID) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void updateStatusUI(int deviceCount) {
