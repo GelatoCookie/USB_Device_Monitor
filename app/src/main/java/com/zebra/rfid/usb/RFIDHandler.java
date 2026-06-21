@@ -20,6 +20,7 @@ import com.zebra.rfid.api3.RfidStatusEvents;
 import com.zebra.rfid.api3.STATUS_EVENT_TYPE;
 import com.zebra.rfid.api3.TagData;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -477,7 +478,10 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
      *    re-enumerates on USB right after connect), and
      *  - {@code InterruptedException} from the SerialInputOutputManager receive
      *    thread, which the SDK interrupts to stop it while tearing the serial
-     *    channel down on disconnect/reconnect.
+     *    channel down on disconnect/reconnect, and
+     *  - {@code IOException} ("Queueing USB request failed") from the receive
+     *    thread's read path when the USB device is detached and its endpoint
+     *    disappears.
      *
      * We swallow only those specific cases and delegate every other throwable to
      * the original handler so genuine crashes still surface normally.
@@ -510,6 +514,12 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         if (t instanceof InterruptedException) {
             return true;
         }
+        // When the USB device is detached the receive thread's read() fails
+        // with IOException("Queueing USB request failed") because the endpoint
+        // is gone; the SDK just ends the thread. We re-init on the next attach.
+        if (t instanceof IOException) {
+            return true;
+        }
         // Starting the serial IO manager twice (USB re-enumeration race) throws
         // IllegalStateException("Already running").
         String msg = t.getMessage();
@@ -520,7 +530,8 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
 
     private boolean isFromSerialInputOutputManager(Throwable t) {
         for (StackTraceElement el : t.getStackTrace()) {
-            if (el.getClassName().contains("SerialInputOutputManager")) {
+            String cls = el.getClassName();
+            if (cls.contains("SerialInputOutputManager") || cls.contains("CommonUsbSerialPort")) {
                 return true;
             }
         }
