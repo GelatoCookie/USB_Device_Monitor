@@ -181,6 +181,46 @@ private void updateStatusUI(int deviceCount) {
 
 ---
 
+## 4.1 Interface-Change Counters
+
+The app tracks how many times the USB interface has changed during the current session via two `int` fields and a derived total, surfaced in the **USB INTERFACE CHANGES** card.
+
+```java
+private int mAttachCount = 0;
+private int mDetachCount = 0;
+
+/** Refreshes the attach/detach/total interface-change counters in the UI. */
+private void updateCountersUI() {
+    mTvAttachCount.setText(String.valueOf(mAttachCount));
+    mTvDetachCount.setText(String.valueOf(mDetachCount));
+    mTvTotalCount.setText(String.valueOf(mAttachCount + mDetachCount));
+}
+```
+
+Each receiver branch increments its counter on the UI thread, logs the running value, and refreshes the card:
+
+```java
+// DETACH branch
+mDetachCount++;
+appendLog("Detach count = " + mDetachCount);
+updateCountersUI();
+
+// ATTACH branch
+mAttachCount++;
+appendLog("Attach count = " + mAttachCount);
+updateCountersUI();
+```
+
+| Counter | View id | Increments on | Color |
+|---|---|---|---|
+| Attach | `tv_attach_count` | `ACTION_USB_DEVICE_ATTACHED` | green `#2E7D32` |
+| Detach | `tv_detach_count` | `ACTION_USB_DEVICE_DETACHED` | red `#C62828` |
+| Total | `tv_total_count` | `mAttachCount + mDetachCount` (derived) | blue `#0D47A1` |
+
+> **Scope:** counters are in-memory session values — they start at `0` on launch and are **not** persisted across activity recreation (e.g. rotation). Persist via `onSaveInstanceState` / `SharedPreferences` if cross-session totals are required.
+
+---
+
 ## 5. Key Log Messages and Their Meaning
 
 ```
@@ -191,11 +231,13 @@ Device PID: 5889             → RFD40 product ID
 USB action: android.hardware.usb.action.USB_DEVICE_DETACHED
 USB device detached
 EXTRA_DEVICE Name=/dev/bus/usb/004/004  RFD4031-G00B700-E8::::EA4004
+Detach count = 1
 
 USB action: android.hardware.usb.action.USB_DEVICE_ATTACHED
 ACTION_USB_DEVICE_ATTACHED
 Name=/dev/bus/usb/004/005  RFD4031-G00B700-E8::::EA4005  1504
 --> Vid =1504
+Attach count = 1
 ```
 
 ---
@@ -347,10 +389,12 @@ onCreate()
     └── refreshUsbModeFromStickyState()               [seed initial transport mode]
 
 onReceive(ATTACHED)             [mUsbReceiver]
-    └── runOnUiThread → refreshDeviceInfo() → updateStatusUI(1)  [green]
+    └── runOnUiThread → mAttachCount++ → updateCountersUI()
+                      → refreshDeviceInfo() → updateStatusUI(1)  [green]
 
 onReceive(DETACHED)             [mUsbReceiver]
-    └── runOnUiThread → refreshDeviceInfo() → updateStatusUI(0)  [gray]
+    └── runOnUiThread → mDetachCount++ → updateCountersUI()
+                      → refreshDeviceInfo() → updateStatusUI(0)  [gray]
 
 onReceive(USB_STATE)            [mBatteryReceiver]
     └── updateUsbModeFromIntent(intent, "broadcast")  → appendLog(summary)

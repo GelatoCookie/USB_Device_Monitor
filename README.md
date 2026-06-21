@@ -7,6 +7,7 @@ An Android app that monitors USB device attach/detach events for the **Zebra RFD
 - **Live status indicator** — large green circle (⌛ RFD40 Awake) when the device is connected; gray circle (💤 Sleep Mode) when disconnected
 - **Device details** — shows Device Count, Vendor ID (VID `1504`), Product ID (PID), and device path on connect
 - **USB transport & power monitoring** — decodes the active USB mode (Power-Only / Charging vs. File Transfer / Debug) from `USB_STATE` and power connect/disconnect broadcasts
+- **Interface-change counters** — running totals of USB **attach**, **detach**, and combined **total** events for the current session
 - **Event log** — timestamped scrollable log of all USB attach/detach, transport, and power events
 - **Wake hint** — prompts user to *"Hold RFD40 trigger to wake up RFID Reader"* when in sleep mode
 - **Toast notifications** on each attach/detach event
@@ -83,6 +84,18 @@ The app registers **two** runtime `BroadcastReceiver`s.
 **Mode determination:** explicit transport function extras (`mtp` / `ptp` / `mass_storage` / `adb` / `rndis`) take priority; if none are present, a `connected && configured` USB is inferred as a data-capable (file-transfer/debug) link.
 
 See [USB_ATTACH_DETACH_DESIGN.md](USB_ATTACH_DETACH_DESIGN.md) for the full design document with code snippets.
+
+## Interface-Change Counters
+
+The app maintains session counters for USB interface changes, shown in the **USB INTERFACE CHANGES** card:
+
+| Counter | Increments on | Color |
+|---|---|---|
+| **Attach** (`mAttachCount`) | `ACTION_USB_DEVICE_ATTACHED` | green |
+| **Detach** (`mDetachCount`) | `ACTION_USB_DEVICE_DETACHED` | red |
+| **Total** | `attach + detach` (derived) | blue |
+
+Each increment is also appended to the event log (`Attach count = N` / `Detach count = N`). Counters are session-scoped — they start at `0` on launch and are not persisted across activity recreation.
 
 ## Key Log Tags
 
