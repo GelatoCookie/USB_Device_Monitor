@@ -278,12 +278,12 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             Log.d(TAG, "STEP: Reader Connected in " + elapsed + "ms");
             // A slow first connect means a stale session from a prior connection;
             // reconnect once to stabilize the link before configuring it.
-            if (elapsed > SLOW_CONNECT_THRESHOLD_MS && reader.isConnected()) {
-                Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
-                        + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
-                notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
-                reconnectToStabilize();
-            }
+            // if (elapsed > SLOW_CONNECT_THRESHOLD_MS && reader.isConnected()) {
+            //     Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
+            //             + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
+            //     notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
+            //     reconnectToStabilize();
+            // }
             configureReader();
             if (reader.isConnected()) {
                 return "RFID Connected: " + reader.getHostName() + " (" + elapsed + " ms)";
@@ -468,14 +468,19 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     }
 
     /**
-     * Installs a process-wide uncaught-exception guard that tolerates a known
-     * Zebra SDK threading bug: the SerialInputOutputManager can throw
-     * {@code IllegalStateException("Already running")} on its own internal
-     * thread during rapid reconnect cycles (the RFD40 re-enumerates on USB
-     * right after connect). That exception is raised on an SDK thread we do not
-     * own, so it cannot be caught with try/catch around our calls. We swallow
-     * only that specific case and delegate every other throwable to the
-     * original handler so genuine crashes still surface normally.
+     * Installs a process-wide uncaught-exception guard that tolerates known
+     * Zebra SDK threading artifacts raised on the SDK's own internal threads
+     * (which we do not own and cannot wrap in try/catch):
+     *
+     *  - {@code IllegalStateException("Already running")} from
+     *    SerialInputOutputManager during rapid reconnect cycles (the RFD40
+     *    re-enumerates on USB right after connect), and
+     *  - {@code InterruptedException} from the SerialInputOutputManager receive
+     *    thread, which the SDK interrupts to stop it while tearing the serial
+     *    channel down on disconnect/reconnect.
+     *
+     * We swallow only those specific cases and delegate every other throwable to
+     * the original handler so genuine crashes still surface normally.
      */
     private void installSdkCrashGuard() {
         if (crashGuardInstalled) {
@@ -497,13 +502,23 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     }
 
     private boolean isBenignSdkThreadingError(Throwable t) {
-        if (!(t instanceof IllegalStateException)) {
+        if (!isFromSerialInputOutputManager(t)) {
             return false;
         }
+        // The SDK stops its receive thread by interrupting it; the resulting
+        // InterruptedException is expected teardown noise, not a crash.
+        if (t instanceof InterruptedException) {
+            return true;
+        }
+        // Starting the serial IO manager twice (USB re-enumeration race) throws
+        // IllegalStateException("Already running").
         String msg = t.getMessage();
-        if (msg == null || !msg.contains("Already running")) {
-            return false;
-        }
+        return t instanceof IllegalStateException
+                && msg != null
+                && msg.contains("Already running");
+    }
+
+    private boolean isFromSerialInputOutputManager(Throwable t) {
         for (StackTraceElement el : t.getStackTrace()) {
             if (el.getClassName().contains("SerialInputOutputManager")) {
                 return true;
