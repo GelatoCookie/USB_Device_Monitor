@@ -64,9 +64,14 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     private volatile boolean resumeRequested = false;
     private volatile boolean readersAttached = false;
 
+    /* Previously installed default handler, restored semantics for real crashes. */
+    private Thread.UncaughtExceptionHandler previousUncaughtHandler;
+    private boolean crashGuardInstalled = false;
+
     void onCreate(Context context, StatusListener statusListener) {
         appContext = context.getApplicationContext();
         listener = statusListener;
+        installSdkCrashGuard();
     }
 
     boolean isReaderConnected() {
@@ -93,7 +98,9 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         Log.d(TAG, "STEP: onUsbDetached -> disconnect + cleanup");
         resumeRequested = false;
         connectionInProgress = false;
-        disconnect();
+        // Serialize with connect on the single background thread so the SDK's
+        // serial IO manager is never started/stopped concurrently.
+        runOnBackground(this::disconnect);
     }
 
     void onDestroy() {
@@ -123,7 +130,7 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     /** Enumerates available readers and hands off to the connect path. */
     private void createInstanceAndConnect() {
         try {
-            readers = new Readers(appContext, ENUM_TRANSPORT.ALL);
+            readers = new Readers(appContext, ENUM_TRANSPORT.SERVICE_USB);
             availableReaders = readers.GetAvailableRFIDReaderList();
             int count = availableReaders == null ? 0 : availableReaders.size();
             Log.d(TAG, "Readers found in ALL transport: " + count);
@@ -320,6 +327,11 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         } catch (Exception e) {
             e.printStackTrace();
         }
+        // Restore the original uncaught-exception handler.
+        if (crashGuardInstalled) {
+            Thread.setDefaultUncaughtExceptionHandler(previousUncaughtHandler);
+            crashGuardInstalled = false;
+        }
     }
 
     //
@@ -339,7 +351,8 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     public void RFIDReaderDisappeared(ReaderDevice readerDevice) {
         Log.d(TAG, "RFIDReaderDisappeared " + readerDevice.getName());
         notifyStatus("Reader disappeared: " + readerDevice.getName());
-        disconnect();
+        // Serialize with connect on the single background thread.
+        runOnBackground(this::disconnect);
     }
 
     //
@@ -386,6 +399,51 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         } catch (RejectedExecutionException e) {
             Log.w(TAG, "Background executor rejected task", e);
         }
+    }
+
+    /**
+     * Installs a process-wide uncaught-exception guard that tolerates a known
+     * Zebra SDK threading bug: the SerialInputOutputManager can throw
+     * {@code IllegalStateException("Already running")} on its own internal
+     * thread during rapid reconnect cycles (the RFD40 re-enumerates on USB
+     * right after connect). That exception is raised on an SDK thread we do not
+     * own, so it cannot be caught with try/catch around our calls. We swallow
+     * only that specific case and delegate every other throwable to the
+     * original handler so genuine crashes still surface normally.
+     */
+    private void installSdkCrashGuard() {
+        if (crashGuardInstalled) {
+            return;
+        }
+        crashGuardInstalled = true;
+        previousUncaughtHandler = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler((thread, throwable) -> {
+            if (isBenignSdkThreadingError(throwable)) {
+                Log.w(TAG, "Ignoring benign Zebra SDK threading error on "
+                        + thread.getName(), throwable);
+                notifyStatus("RFID SDK threading warning ignored: " + throwable.getMessage());
+                return;
+            }
+            if (previousUncaughtHandler != null) {
+                previousUncaughtHandler.uncaughtException(thread, throwable);
+            }
+        });
+    }
+
+    private boolean isBenignSdkThreadingError(Throwable t) {
+        if (!(t instanceof IllegalStateException)) {
+            return false;
+        }
+        String msg = t.getMessage();
+        if (msg == null || !msg.contains("Already running")) {
+            return false;
+        }
+        for (StackTraceElement el : t.getStackTrace()) {
+            if (el.getClassName().contains("SerialInputOutputManager")) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void beep() {
