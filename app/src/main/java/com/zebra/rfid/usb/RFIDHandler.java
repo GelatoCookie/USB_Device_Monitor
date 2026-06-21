@@ -30,8 +30,8 @@ import java.util.concurrent.RejectedExecutionException;
  * Thin wrapper around the Zebra RFID SDK (com.zebra.rfid.api3) that drives the
  * reader lifecycle from USB attach/detach events:
  *
- *  - {@link #onUsbAttached()}  : initialize the SDK and connect to the reader.
- *  - {@link #onUsbDetached()}  : disconnect and clean up reader state.
+ *  - {@link #onUsbAttached()}  : clean up any stale session, then init the SDK and connect.
+ *  - {@link #onUsbDetached()}  : stop using the reader (cleanup deferred to next attach).
  *  - {@link #onDestroy()}      : dispose SDK resources.
  *
  * Adapted from GelatoCookie/TC53eBspTest (RFIDHandler.java), trimmed to the
@@ -101,25 +101,33 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     // USB-driven lifecycle entry points
     //
 
-    /** ACTION_USB_DEVICE_ATTACHED -> initialize SDK and connect. */
+    /** ACTION_USB_DEVICE_ATTACHED -> clean up any stale session, then init SDK and connect. */
     void onUsbAttached() {
-        Log.d(TAG, "STEP: onUsbAttached -> init RFID SDK + connect");
+        Log.d(TAG, "STEP: onUsbAttached -> cleanup stale session + init RFID SDK + connect");
         resumeRequested = true;
-        if (isReaderConnected()) {
-            notifyStatus("RFID already connected: " + reader.getHostName());
-            return;
-        }
-        initSdk();
+        // Tear down any leftover session from a previous connection FIRST, then
+        // (re)initialize and connect. This replaces the disconnect that used to
+        // run on detach: at detach time the USB endpoint is already gone, so
+        // disconnecting there made the SDK serial IO manager fault on a dead
+        // endpoint. Serialized on the single background thread, then init is
+        // posted back to the main looper so the connect path runs after cleanup.
+        runOnBackground(() -> {
+            disconnect();
+            mainHandler.post(this::initSdk);
+        });
     }
 
-    /** ACTION_USB_DEVICE_DETACHED -> disconnect and clean up. */
+    /** ACTION_USB_DEVICE_DETACHED -> stop using the reader; cleanup deferred to next attach. */
     void onUsbDetached() {
-        Log.d(TAG, "STEP: onUsbDetached -> disconnect + cleanup");
+        Log.d(TAG, "STEP: onUsbDetached -> stop (cleanup deferred to next attach)");
         resumeRequested = false;
         connectionInProgress = false;
-        // Serialize with connect on the single background thread so the SDK's
-        // serial IO manager is never started/stopped concurrently.
-        runOnBackground(this::disconnect);
+        // NOTE: the SDK disconnect/cleanup is intentionally NOT performed here.
+        // When the device is detached its USB endpoint is already gone, so
+        // disconnecting now makes the SDK serial IO manager fault on the dead
+        // endpoint (IOException "Queueing USB request failed" / "Receive thread
+        // interrupted"). The stale session is torn down at the start of the next
+        // onUsbAttached() instead.
     }
 
     void onDestroy() {
