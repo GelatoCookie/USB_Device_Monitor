@@ -152,11 +152,6 @@ public class MainActivity extends AppCompatActivity {
         }
         updateStatusUI(count);
 
-        // On startup, initialize the RFID SDK and attempt to connect to the
-        // RFD40. If permissions are still pending, the connect is retried once
-        // they are granted (see onRequestPermissionsResult).
-        attemptStartupRfidConnection();
-
         IntentFilter filter = new IntentFilter();
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
@@ -189,6 +184,22 @@ public class MainActivity extends AppCompatActivity {
         if (mRfidHandler != null) {
             mRfidHandler.onDestroy();
         }
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // When the app returns to the foreground, clean up any stale SDK state
+        // and reconnect to the reader if it is present or becomes available.
+        attemptStartupRfidConnection();
+    }
+
+    @Override
+    protected void onPause() {
+        if (mRfidHandler != null) {
+            mRfidHandler.onAppBackground();
+        }
+        super.onPause();
     }
 
     /** Requests the runtime Bluetooth permissions the RFID SDK needs on API 31+. */

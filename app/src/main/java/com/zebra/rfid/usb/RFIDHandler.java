@@ -111,6 +111,26 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     //
 
     /**
+     * App foreground / resume -> clean up any stale session, then init the SDK
+     * and attempt to connect.
+     */
+    void onAppForeground() {
+        Log.d(TAG, "STEP: onAppForeground -> cleanup stale session + init RFID SDK + connect");
+        prepareForConnect();
+    }
+
+    /**
+     * App background / suspend -> disconnect quietly so the reader is not left
+     * active while the activity is no longer visible.
+     */
+    void onAppBackground() {
+        Log.d(TAG, "STEP: onAppBackground -> disconnect quietly");
+        resumeRequested = false;
+        connectionInProgress = false;
+        runOnBackground(this::disconnectQuietly);
+    }
+
+    /**
      * App startup -> initialize the RFID SDK and attempt to connect to an
      * already-attached RFD40. If no reader is present / reachable, the
      * connection-result callback reports the failure so the UI can prompt the
@@ -118,19 +138,21 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
      */
     void startup() {
         Log.d(TAG, "STEP: startup -> init RFID SDK + attempt connect");
-        onUsbAttached();
+        onAppForeground();
     }
 
     /** ACTION_USB_DEVICE_ATTACHED -> clean up any stale session, then init SDK and connect. */
     void onUsbAttached() {
         Log.d(TAG, "STEP: onUsbAttached -> cleanup stale session + init RFID SDK + connect");
+        prepareForConnect();
+    }
+
+    private void prepareForConnect() {
         resumeRequested = true;
         // Tear down any leftover session from a previous connection FIRST, then
-        // (re)initialize and connect. This replaces the disconnect that used to
-        // run on detach: at detach time the USB endpoint is already gone, so
-        // disconnecting there made the SDK serial IO manager fault on a dead
-        // endpoint. Serialized on the single background thread, then init is
-        // posted back to the main looper so the connect path runs after cleanup.
+        // (re)initialize and connect. Serialized on the single background
+        // thread, then init is posted back to the main looper so the connect
+        // path runs after cleanup.
         runOnBackground(() -> {
             if (readers != null) {
                 readers.Dispose();
@@ -348,14 +370,6 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             reader.connect();
             long elapsed = System.currentTimeMillis() - start;
             Log.d(TAG, "STEP: Reader Connected in " + elapsed + "ms");
-            // A slow first connect means a stale session from a prior connection;
-            // reconnect once to stabilize the link before configuring it.
-            if (elapsed > SLOW_CONNECT_THRESHOLD_MS && reader.isConnected()) {
-                Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
-                        + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
-                notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
-                reconnectToStabilize();
-            }
             configureReader();
             if (reader.isConnected()) {
                 return "RFID Connected: " + reader.getHostName() + " (" + elapsed + " ms)";
@@ -442,6 +456,7 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                 reader.disconnect();
                 reader = null;
                 notifyConnectionResult(false, "RFID Disconnected");
+                playDisconnectBeep();
             }
         } catch (InvalidUsageException | OperationFailureException e) {
             Log.e(TAG, "Disconnect error", e);
@@ -449,6 +464,26 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             Log.e(TAG, "Unexpected disconnect error", e);
         } finally {
             // Re-attach on the next connect attempt to avoid stale subscriptions.
+            readersAttached = false;
+        }
+    }
+
+    private synchronized void disconnectQuietly() {
+        Log.d(TAG, "STEP: Disconnect quietly");
+        try {
+            if (reader != null) {
+                if (eventHandler != null) {
+                    reader.Events.removeEventsListener(eventHandler);
+                }
+                reader.disconnect();
+                reader = null;
+                playDisconnectBeep();
+            }
+        } catch (InvalidUsageException | OperationFailureException e) {
+            Log.e(TAG, "Quiet disconnect error", e);
+        } catch (Exception e) {
+            Log.e(TAG, "Unexpected quiet disconnect error", e);
+        } finally {
             readersAttached = false;
         }
     }
@@ -626,5 +661,13 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
 
     private void beep() {
         runOnBackground(() -> toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200));
+    }
+
+    private void playDisconnectBeep() {
+        mainHandler.post(() -> {
+            toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 120);
+            mainHandler.postDelayed(() ->
+                    toneG.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 120), 160L);
+        });
     }
 }
