@@ -8,7 +8,8 @@ An Android app that monitors USB device attach/detach events for the **Zebra RFD
 - **Device details** — shows Device Count, Vendor ID (VID `1504`), Product ID (PID), and device path on connect
 - **USB transport & power monitoring** — decodes the active USB mode (Power-Only / Charging vs. File Transfer / Debug) from `USB_STATE` and power connect/disconnect broadcasts
 - **Interface-change counters** — running totals of USB **attach**, **detach**, and combined **total** events for the current session
-- **Automatic RFID reader control** — on RFD40 attach the app initializes the Zebra RFID SDK and connects the reader; on detach it disconnects and cleans up
+- **Automatic RFID reader control** — on app startup and on RFD40 attach the app initializes the Zebra RFID SDK and connects the reader; on detach it stops using the reader (stale-session cleanup is deferred to the next attach)
+- **RFD40 connection prompt** — if the reader cannot connect at startup (sled off or unplugged) the status card prompts the user to *"Turn on the RFD40 (hold its trigger to wake it) or attach it via USB"*
 - **Event log** — timestamped scrollable log of all USB attach/detach, transport, power, and RFID reader events
 - **Wake hint** — prompts user to *"Hold RFD40 trigger to wake up RFID Reader"* when in sleep mode
 - **Toast notifications** on each attach/detach event
@@ -103,15 +104,18 @@ Each increment is also appended to the event log (`Attach count = N` / `Detach c
 
 ## RFID SDK Integration
 
-When the Zebra RFD40 sled is attached/detached, `MainActivity` drives the Zebra RFID API3 SDK through a dedicated `RFIDHandler`:
+On startup and whenever the Zebra RFD40 sled is attached/detached, `MainActivity` drives the Zebra RFID API3 SDK through a dedicated `RFIDHandler`:
 
-| USB Event | `RFIDHandler` call | Action |
+| Trigger | `RFIDHandler` call | Action |
 |---|---|---|
-| `USB_DEVICE_ATTACHED` (VID `1504`) | `onUsbAttached()` | Initialize SDK → enumerate readers → connect → configure event listeners |
-| `USB_DEVICE_DETACHED` | `onUsbDetached()` | Remove listeners → disconnect reader → release reader state |
+| App startup (after Bluetooth permissions) | `startup()` | Initialize SDK → enumerate readers → connect; on failure show the RFD40 prompt |
+| `USB_DEVICE_ATTACHED` (VID `1504`) | `onUsbAttached()` | Clean up any stale session → initialize SDK → enumerate readers → connect → configure event listeners |
+| `USB_DEVICE_DETACHED` | `onUsbDetached()` | Best-effort stop the reader's read pipeline (so the SDK IO manager stops polling the dead endpoint); full SDK cleanup is deferred to the next attach |
 | `onDestroy()` | `onDestroy()` | Dispose SDK + shut down background executor |
 
-Reader status (connecting, connected, disconnected, tag reads, errors) is routed back into the event log with a `[RFID]` prefix via a `StatusListener` callback. SDK work runs on a single-threaded background executor with `volatile` guards (`initializationInProgress`, `connectionInProgress`, `resumeRequested`, `readersAttached`) to avoid duplicate init/connect races.
+The Zebra RFID SDK enumerates bonded Bluetooth devices on init, so on API 31+ `MainActivity` requests the runtime `BLUETOOTH_CONNECT` / `BLUETOOTH_SCAN` permissions on launch and runs the startup connect once they are granted.
+
+Reader status (connecting, connected, disconnected, tag reads, errors) is routed back into the event log with a `[RFID]` prefix via a `StatusListener` callback. The same listener also reports a terminal connection result — `onRfidConnectionResult(connected, message)` — that drives the status card: a green **RFD40 Connected** state on success, or an amber **RFD40 Not Connected** prompt on failure. SDK work runs on a single-threaded background executor with `volatile` guards (`initializationInProgress`, `connectionInProgress`, `resumeRequested`, `readersAttached`) to avoid duplicate init/connect races.
 
 > **SDK requirement:** the proprietary Zebra RFID API3 `.aar` is **not** bundled in this repository. Drop it into `app/libs/` (see [app/libs/README.md](app/libs/README.md)). `app/build.gradle` pulls it in via `implementation fileTree(dir: 'libs', include: ['*.aar', '*.jar'])`. Until present, the `com.zebra.rfid.api3.*` symbols in `RFIDHandler.java` will not resolve and the project will not build.
 

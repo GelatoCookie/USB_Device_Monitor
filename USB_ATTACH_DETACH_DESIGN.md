@@ -387,16 +387,22 @@ onCreate()
     └── registerReceiver(mUsbReceiver, filter)        [ATTACHED/DETACHED]
     └── registerReceiver(mBatteryReceiver, usbStateFilter)  [USB_STATE/POWER_*]
     └── refreshUsbModeFromStickyState()               [seed initial transport mode]
+    └── ensureBluetoothPermissions()                  [request BLUETOOTH_CONNECT/SCAN on API 31+]
+    └── attemptStartupRfidConnection()                [if permitted → mRfidHandler.startup()]
+
+onRequestPermissionsResult(BT granted)
+    └── mRfidHandler.startup()                        [deferred startup connect]
+    └── (denied) → showRfd40Prompt(...)
 
 onReceive(ATTACHED)             [mUsbReceiver]
     └── runOnUiThread → mAttachCount++ → updateCountersUI()
                       → refreshDeviceInfo() → updateStatusUI(1)  [green]
-    └── if VID == RFID_VID → mRfidHandler.onUsbAttached()  [init SDK + connect]
+    └── if VID == RFID_VID → mRfidHandler.onUsbAttached()  [cleanup stale → init SDK + connect]
 
 onReceive(DETACHED)             [mUsbReceiver]
     └── runOnUiThread → mDetachCount++ → updateCountersUI()
                       → refreshDeviceInfo() → updateStatusUI(0)  [gray]
-    └── mRfidHandler.onUsbDetached()                      [disconnect + cleanup]
+    └── mRfidHandler.onUsbDetached()                      [stop using reader; cleanup deferred]
 
 onReceive(USB_STATE)            [mBatteryReceiver]
     └── updateUsbModeFromIntent(intent, "broadcast")  → appendLog(summary)
@@ -441,14 +447,18 @@ reader lifecycle so `MainActivity` only forwards two events plus teardown.
 
 ### 10.1 Trigger points
 
-| USB Event | `MainActivity` wiring | `RFIDHandler` behavior |
+| Trigger | `MainActivity` wiring | `RFIDHandler` behavior |
 |---|---|---|
-| `USB_DEVICE_ATTACHED` (VID `1504`) | `mRfidHandler.onUsbAttached()` | `initSdk()` → `createInstanceAndConnect()` → `connectReader()` → `configureReader()` |
-| `USB_DEVICE_DETACHED` | `mRfidHandler.onUsbDetached()` | `disconnect()` (remove listeners, `reader.disconnect()`, null out reader) |
+| App startup (after BT permissions) | `mRfidHandler.startup()` | `onUsbAttached()` flow → init + connect; on failure → RFD40 prompt |
+| `USB_DEVICE_ATTACHED` (VID `1504`) | `mRfidHandler.onUsbAttached()` | clean up stale session → `initSdk()` → `createInstanceAndConnect()` → `connectReader()` → `configureReader()` |
+| `USB_DEVICE_DETACHED` | `mRfidHandler.onUsbDetached()` | stop using the reader (clear flags); SDK cleanup deferred to next attach |
 | Activity `onDestroy()` | `mRfidHandler.onDestroy()` | `dispose()` (disconnect + `readers.Dispose()` + executor shutdown) |
 
 The attach branch is gated on `finalVid == RFID_VID` so unrelated USB peripherals do
-not trigger an RFID connect attempt.
+not trigger an RFID connect attempt. On detach the SDK is intentionally **not**
+disconnected — the USB endpoint is already gone, so disconnecting there would fault
+the SDK's serial IO manager on a dead endpoint. The stale session is torn down at
+the start of the next `onUsbAttached()` instead.
 
 ### 10.2 SDK dependency
 
@@ -466,20 +476,35 @@ dependencies {
 Required Bluetooth permissions and the USB host feature are already declared in
 `AndroidManifest.xml`.
 
-### 10.3 Initialize + connect (attach)
+### 10.3 Startup + initialize + connect (attach)
+
+On app launch `MainActivity.attemptStartupRfidConnection()` calls `startup()` once the
+runtime Bluetooth permissions are granted; `startup()` runs the same path as a USB
+attach. `onUsbAttached()` first disposes any stale `Readers` instance, then
+(re)initializes and connects:
 
 ```java
+void startup() {
+    onUsbAttached();                    // same init + connect path as a USB attach
+}
+
 void onUsbAttached() {
     resumeRequested = true;
-    if (isReaderConnected()) return;
-    initSdk();                          // background: new Readers(ctx, ENUM_TRANSPORT.ALL)
+    runOnBackground(() -> {
+        if (readers != null) {          // tear down any stale session first
+            readers.Dispose();
+            readers = null;
+            readersAttached = false;
+        }
+        mainHandler.post(this::initSdk);
+    });
 }
 
 private void createInstanceAndConnect() {
-    readers = new Readers(appContext, ENUM_TRANSPORT.ALL);
+    readers = new Readers(appContext, ENUM_TRANSPORT.SERVICE_USB);
     availableReaders = readers.GetAvailableRFIDReaderList();
     if (availableReaders == null || availableReaders.isEmpty()) {
-        scheduleDiscoveryRetry(0);      // retry via ENUM_TRANSPORT.RE_USB (up to 3x)
+        scheduleDiscoveryRetry(0);      // retry via SERVICE_USB (up to 3x)
         return;
     }
     if (resumeRequested) connectReader();
@@ -487,35 +512,67 @@ private void createInstanceAndConnect() {
 
 private synchronized String connect() {
     reader.connect();
+    // a slow first connect implies a stale session → reconnect once to stabilize
     configureReader();                  // addEventsListener + enable handheld/tag events
     return "RFID Connected: " + reader.getHostName();
 }
 ```
 
-### 10.4 Disconnect + cleanup (detach)
+When the connect attempt ends without a usable reader (sled off or unplugged), the
+handler reports `onRfidConnectionResult(false, ...)` so the UI can prompt the user to
+turn on or attach the RFD40 (see §10.5).
+
+### 10.4 Detach — proactive stop, deferred cleanup
+
+On detach the handler clears its run flags and **best-effort stops the SDK's
+tag-read pipeline** so the serial IO manager is not left actively polling the
+now-dead USB endpoint. A full `reader.disconnect()` is still **not** performed
+here (that faults harder on a dead endpoint); the stale session is torn down at
+the start of the next `onUsbAttached()`.
 
 ```java
 void onUsbDetached() {
     resumeRequested = false;
     connectionInProgress = false;
-    disconnect();
+    // Best-effort stop the read pipeline so the SDK IO manager stops polling the
+    // dead endpoint. Every call is guarded because the endpoint is already gone.
+    final RFIDReader detached = reader;
+    final EventHandler handler = eventHandler;
+    runOnBackground(() -> stopReaderQuietly(detached, handler));
+    // No reader.disconnect() here — deferred to the next onUsbAttached().
 }
 
-private synchronized void disconnect() {
-    if (reader != null) {
-        if (eventHandler != null) reader.Events.removeEventsListener(eventHandler);
-        reader.disconnect();
-        reader = null;
-    }
-    readersAttached = false;            // re-attach on next connect
+private void stopReaderQuietly(RFIDReader r, EventHandler handler) {
+    if (r == null) return;
+    try { r.Events.setTagReadEvent(false); r.Events.setHandheldEvent(false); }
+    catch (Exception ignored) { /* expected on a dead endpoint */ }
+    try { if (handler != null) r.Events.removeEventsListener(handler); }
+    catch (Exception ignored) { /* expected on a dead endpoint */ }
 }
 ```
+
+> **Unavoidable SDK log on physical yank:** the in-flight read that fails the
+> instant the device is pulled is logged *inside* the SDK
+> (`RFIDSerialIOMgr E Run ending due to exception` / `java.io.IOException:
+> Queueing USB request failed`) tens of milliseconds **before** the
+> `USB_DEVICE_DETACHED` broadcast even reaches the app, so that single line
+> cannot be suppressed from app code. The SDK catches it and ends its receive
+> thread; the proactive stop above keeps it to that one benign occurrence.
 
 ### 10.5 Concurrency model
 
 All SDK calls run on a single-threaded background executor; UI/status messages are
-posted back to the main thread through a `StatusListener` that appends to the event
-log with a `[RFID]` prefix. `volatile` guards prevent duplicate init/connect races:
+posted back to the main thread through a `StatusListener`. The listener has two
+callbacks:
+
+- `onRfidStatus(message)` — appends progress/diagnostic lines to the event log with a
+  `[RFID]` prefix.
+- `onRfidConnectionResult(connected, message)` — a terminal connect outcome that drives
+  the status card: a green **RFD40 Connected** state on success, or an amber
+  **RFD40 Not Connected** prompt (*"Turn on the RFD40 (hold its trigger to wake it) or
+  attach it via USB"*) on failure / disconnect.
+
+`volatile` guards prevent duplicate init/connect races:
 
 | Guard | Purpose |
 |---|---|
@@ -543,5 +600,26 @@ in-app event log:
 [RFID] Initializing RFID SDK...
 [RFID] RFID Connected: RFD4031-G00B700-E8 (842 ms)
 [RFID] Tag read: E280689400004003... (RSSI -52)
-[RFID] RFID Disconnected
+[RFID] No RFID readers found
+[RFID] Not connected: No reader available to connect
 ```
+
+### 10.8 SDK threading crash guard
+
+The Zebra SDK runs its serial IO on threads the app does not own and cannot wrap
+in `try/catch`. `RFIDHandler` installs a process-wide
+`Thread.UncaughtExceptionHandler` that **swallows only known SDK teardown
+artifacts** and delegates every other throwable to the original handler so
+genuine crashes still surface:
+
+| Artifact | When it occurs |
+|---|---|
+| `IOException: Queueing USB request failed` | receive thread reads a detached (dead) endpoint |
+| `InterruptedException` / `Receive thread interrupted` | SDK interrupts the receive thread during teardown |
+| `IllegalStateException: Already running` | serial IO manager started twice on rapid USB re-enumeration |
+
+Matching is done first by message text (`"Queueing USB request failed"`,
+`"Receive thread interrupted"`) — independent of the R8-obfuscated stack — and
+then by the originating SDK class (`SerialInputOutputManager` /
+`CommonUsbSerialPort`), so the artifact is reliably absorbed across SDK builds.
+The guard is removed in `onDestroy()`.

@@ -7,7 +7,6 @@ import android.Manifest;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.pm.PackageManager;
-import android.os.Build;
 import android.os.Bundle;
 
 import androidx.activity.EdgeToEdge;
@@ -110,9 +109,25 @@ public class MainActivity extends AppCompatActivity {
 
         mUsbManager = getSystemService(UsbManager.class);
 
-        // Route RFID reader status messages into the event log.
+        // Route RFID reader status messages into the event log, and reflect the
+        // connection outcome in the status card (prompting the user when the
+        // RFD40 is not connected).
         mRfidHandler = new RFIDHandler();
-        mRfidHandler.onCreate(this, status -> appendLog("[RFID] " + status));
+        mRfidHandler.onCreate(this, new RFIDHandler.StatusListener() {
+            @Override
+            public void onRfidStatus(String status) {
+                appendLog("[RFID] " + status);
+            }
+
+            @Override
+            public void onRfidConnectionResult(boolean connected, String message) {
+                if (connected) {
+                    showRfidConnected(message);
+                } else {
+                    showRfd40Prompt(message);
+                }
+            }
+        });
 
         // The Zebra RFID SDK queries bonded Bluetooth devices on init, which
         // requires the runtime BLUETOOTH_CONNECT/SCAN permissions on API 31+.
@@ -137,19 +152,24 @@ public class MainActivity extends AppCompatActivity {
         }
         updateStatusUI(count);
 
+        // On startup, initialize the RFID SDK and attempt to connect to the
+        // RFD40. If permissions are still pending, the connect is retried once
+        // they are granted (see onRequestPermissionsResult).
+        attemptStartupRfidConnection();
+
         IntentFilter filter = new IntentFilter();
         filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
         filter.addAction(UsbManager.ACTION_USB_ACCESSORY_ATTACHED);
         filter.addAction(UsbManager.ACTION_USB_ACCESSORY_DETACHED);
-        registerReceiver(mUsbReceiver, filter);
+        registerReceiver(mUsbReceiver, filter, Context.RECEIVER_EXPORTED);
 
         // Active USB broadcast and state monitoring (USB_STATE + power connect/disconnect)
         IntentFilter usbStateFilter = new IntentFilter();
         usbStateFilter.addAction(ACTION_USB_STATE);
         usbStateFilter.addAction(Intent.ACTION_POWER_CONNECTED);
         usbStateFilter.addAction(Intent.ACTION_POWER_DISCONNECTED);
-        registerReceiver(mBatteryReceiver, usbStateFilter);
+        registerReceiver(mBatteryReceiver, usbStateFilter, Context.RECEIVER_EXPORTED);
 
         // Seed the initial mode from the sticky USB_STATE broadcast, if available.
         refreshUsbModeFromStickyState();
@@ -173,9 +193,6 @@ public class MainActivity extends AppCompatActivity {
 
     /** Requests the runtime Bluetooth permissions the RFID SDK needs on API 31+. */
     private void ensureBluetoothPermissions() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
-            return;
-        }
         List<String> needed = new ArrayList<>();
         if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
                 != PackageManager.PERMISSION_GRANTED) {
@@ -207,23 +224,60 @@ public class MainActivity extends AppCompatActivity {
                     ? "Bluetooth permissions granted"
                     : "Bluetooth permissions denied - RFID connect may fail");
 
-            // If the RFD40 sled is already attached, connect now that we have
-            // the permission (no need to re-plug the device).
-            if (allGranted && mRfidHandler != null && isRfidSledAttached()) {
-                appendLog("RFD40 already attached - connecting RFID reader");
-                mRfidHandler.onUsbAttached();
+            // Permissions resolved -> attempt the startup RFID connection now.
+            // If no RFD40 is attached/awake, the connection-result callback
+            // shows the prompt to turn on or attach the device.
+            if (allGranted && mRfidHandler != null) {
+                appendLog("Permissions granted - starting RFID connect");
+                mRfidHandler.startup();
+            } else {
+                showRfd40Prompt("Bluetooth permission denied");
             }
         }
     }
 
-    /** Returns true if a Zebra RFID sled (VID 1504) is currently on the USB bus. */
-    private boolean isRfidSledAttached() {
-        for (UsbDevice device : mUsbManager.getDeviceList().values()) {
-            if (device.getVendorId() == RFID_VID) {
-                return true;
-            }
+    /**
+     * Startup entry point: initializes the RFID SDK and attempts to connect to
+     * the RFD40. When the required Bluetooth permissions are not yet granted,
+     * the connect is deferred until {@link #onRequestPermissionsResult}.
+     */
+    private void attemptStartupRfidConnection() {
+        if (mRfidHandler == null) {
+            return;
         }
-        return false;
+        if (checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT)
+                != PackageManager.PERMISSION_GRANTED) {
+            appendLog("Waiting for Bluetooth permissions before RFID connect...");
+            return;
+        }
+        appendLog("Startup: initializing RFID SDK and connecting...");
+        mRfidHandler.startup();
+    }
+
+    /** Updates the status card to reflect a successful RFID connection. */
+    private void showRfidConnected(String message) {
+        mViewStatusCircle.setBackgroundResource(R.drawable.shape_circle_awake);
+        mTvStatusIcon.setText("\u2705");
+        mTvStatusTitle.setText("RFD40 Connected");
+        mTvStatusTitle.setTextColor(0xFF2E7D32);
+        mTvStatusHint.setText((message != null && !message.isEmpty())
+                ? message : "RFID reader connected and ready");
+    }
+
+    /**
+     * Shows a prompt in the status card asking the user to turn on (wake) or
+     * attach the RFD40 after a failed RFID connection attempt.
+     */
+    private void showRfd40Prompt(String reason) {
+        mViewStatusCircle.setBackgroundResource(R.drawable.shape_circle_sleep);
+        mTvStatusIcon.setText("\u26A0\uFE0F");
+        mTvStatusTitle.setText("RFD40 Not Connected");
+        mTvStatusTitle.setTextColor(0xFFC62828);
+        mTvStatusHint.setText("Turn on the RFD40 (hold its trigger to wake it) or attach it via USB");
+        if (reason != null && !reason.isEmpty()) {
+            appendLog("[RFID] Not connected: " + reason);
+        }
+        makeText(this, "Please turn on or attach the RFD40", LENGTH_SHORT).show();
     }
 
     private void updateStatusUI(int deviceCount) {
@@ -249,7 +303,7 @@ public class MainActivity extends AppCompatActivity {
         mScrollLog.post(() -> mScrollLog.fullScroll(ScrollView.FOCUS_DOWN));
     }
 
-    /** Refreshes the attach/detach/total interface-change counters in the UI. */
+    /** Refreshes the attachment/detach/total interface-change counters in the UI. */
     private void updateCountersUI() {
         mTvAttachCount.setText(String.valueOf(mAttachCount));
         mTvDetachCount.setText(String.valueOf(mDetachCount));
@@ -285,37 +339,35 @@ public class MainActivity extends AppCompatActivity {
 
             Log.d(TAGUSB, "USB Client action: " + action);
 
-            if (ACTION_USB_STATE.equals(action)) {
-                updateUsbModeFromIntent(intent, "broadcast");
-                return;
-            }
+            switch (action) {
+                case ACTION_USB_STATE:
+                    updateUsbModeFromIntent(intent, "broadcast");
+                    break;
 
-            if (Intent.ACTION_POWER_CONNECTED.equals(action)) {
-                refreshUsbModeFromStickyState();
-                final String mode = usbFileTransferModeActive
-                        ? "File Transfer / Debug" : "Power-Only (Charging)";
-                Log.d(TAGUSB, "ACTION_POWER_CONNECTED mode=" + mode
-                        + ", connected=" + usbConnected
-                        + ", configured=" + usbConfigured
-                        + ", fileTransfer=" + usbFileTransferModeActive);
-                runOnUiThread(() -> {
-                    mTvUsbStatus.setText("POWER CONNECTED  " + mTimeFormat.format(new Date()));
+                case Intent.ACTION_POWER_CONNECTED: {
+                    refreshUsbModeFromStickyState();
+                    final String mode = usbFileTransferModeActive
+                            ? "File Transfer / Debug" : "Power-Only (Charging)";
+                    Log.d(TAGUSB, "ACTION_POWER_CONNECTED mode=" + mode
+                            + ", connected=" + usbConnected
+                            + ", configured=" + usbConfigured
+                            + ", fileTransfer=" + usbFileTransferModeActive);
+                    mTvUsbStatus.setText(String.format(Locale.US, "POWER CONNECTED  %s", mTimeFormat.format(new Date())));
                     appendLog("USB Client action: " + action);
                     appendLog("Power connected -> " + mode);
-                });
-                return;
-            }
+                    break;
+                }
 
-            if (Intent.ACTION_POWER_DISCONNECTED.equals(action)) {
-                usbConnected = false;
-                usbConfigured = false;
-                usbFileTransferModeActive = false;
-                Log.d(TAGUSB, "ACTION_POWER_DISCONNECTED");
-                runOnUiThread(() -> {
-                    mTvUsbStatus.setText("POWER DISCONNECTED  " + mTimeFormat.format(new Date()));
+                case Intent.ACTION_POWER_DISCONNECTED: {
+                    usbConnected = false;
+                    usbConfigured = false;
+                    usbFileTransferModeActive = false;
+                    Log.d(TAGUSB, "ACTION_POWER_DISCONNECTED");
+                    mTvUsbStatus.setText(String.format(Locale.US, "POWER DISCONNECTED  %s", mTimeFormat.format(new Date())));
                     appendLog("USB Client action: " + action);
                     appendLog("Power disconnected");
-                });
+                    break;
+                }
             }
         }
     };
@@ -393,25 +445,22 @@ public class MainActivity extends AppCompatActivity {
             if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
                 Log.d(TAG, "USB device detached");
 
-                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
                 String nameInfo = "—";
                 if (device != null) {
                     nameInfo = device.getDeviceName() + device.getProductName() + device.getDeviceId();
                     Log.d(TAG, "EXTRA_DEVICE Name=" + nameInfo);
                 }
 
-                final String logName = nameInfo;
-                runOnUiThread(() -> {
-                    mDetachCount++;
-                    mTvUsbStatus.setText("DETACHED  " + mTimeFormat.format(new Date()));
-                    appendLog("USB action: " + action);
-                    appendLog("USB device detached");
-                    appendLog("EXTRA_DEVICE Name=" + logName);
-                    appendLog("Detach count = " + mDetachCount);
-                    updateCountersUI();
-                    refreshDeviceInfo();
-                    makeText(MainActivity.this, "ACTION_USB_DEVICE_DETACHED", LENGTH_SHORT).show();
-                });
+                mDetachCount++;
+                mTvUsbStatus.setText(String.format(Locale.US, "DETACHED  %s", mTimeFormat.format(new Date())));
+                appendLog("USB action: " + action);
+                appendLog("USB device detached");
+                appendLog("EXTRA_DEVICE Name=" + nameInfo);
+                appendLog("Detach count = " + mDetachCount);
+                updateCountersUI();
+                refreshDeviceInfo();
+                makeText(MainActivity.this, "ACTION_USB_DEVICE_DETACHED", LENGTH_SHORT).show();
 
                 // USB detached -> disconnect the RFID reader and clean up.
                 if (mRfidHandler != null) {
@@ -422,7 +471,7 @@ public class MainActivity extends AppCompatActivity {
             if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
                 Log.d(TAG, "ACTION_USB_DEVICE_ATTACHED");
 
-                UsbDevice device = (UsbDevice) intent.getExtras().get("device");
+                UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice.class);
                 String nameInfo = "—";
                 int vid = -1;
                 if (device != null) {
@@ -433,26 +482,22 @@ public class MainActivity extends AppCompatActivity {
                     Log.d(TAG, "--> Vid =" + vid);
                 }
 
-                final String logName = nameInfo;
-                final int finalVid = vid;
-
-                runOnUiThread(() -> {
-                    mAttachCount++;
-                    mTvUsbStatus.setText("ATTACHED  " + mTimeFormat.format(new Date()));
-                    appendLog("USB action: " + action);
-                    appendLog("ACTION_USB_DEVICE_ATTACHED");
-                    appendLog("Name=" + logName);
-                    appendLog("--> Vid =" + finalVid);
-                    appendLog("Attach count = " + mAttachCount);
-                    updateCountersUI();
-                    refreshDeviceInfo();
-                    makeText(MainActivity.this, "ACTION_USB_DEVICE_ATTACHED", LENGTH_SHORT).show();
-                    if (finalVid == RFID_VID)
-                        makeText(MainActivity.this, "SLED_ZEBRA_ATTACHED VID=" + RFID_VID, LENGTH_SHORT).show();
-                });
+                mAttachCount++;
+                mTvUsbStatus.setText(String.format(Locale.US, "ATTACHED  %s", mTimeFormat.format(new Date())));
+                appendLog("USB action: " + action);
+                appendLog("ACTION_USB_DEVICE_ATTACHED");
+                appendLog("Name=" + nameInfo);
+                appendLog("--> Vid =" + vid);
+                appendLog("Attach count = " + mAttachCount);
+                updateCountersUI();
+                refreshDeviceInfo();
+                makeText(MainActivity.this, "ACTION_USB_DEVICE_ATTACHED", LENGTH_SHORT).show();
+                if (vid == RFID_VID) {
+                    makeText(MainActivity.this, "SLED_ZEBRA_ATTACHED VID=" + RFID_VID, LENGTH_SHORT).show();
+                }
 
                 // Zebra RFID sled attached -> initialize the SDK and connect.
-                if (finalVid == RFID_VID && mRfidHandler != null) {
+                if (vid == RFID_VID && mRfidHandler != null) {
                     mRfidHandler.onUsbAttached();
                 }
             }

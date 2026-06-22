@@ -44,6 +44,15 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     /** Callback for surfacing reader status messages to the UI / event log. */
     interface StatusListener {
         void onRfidStatus(String message);
+
+        /**
+         * Reports a terminal connect outcome so the UI can prompt the user.
+         *
+         * @param connected true once the reader is connected, false when a
+         *                  connect attempt finished without a usable reader.
+         * @param message   human-readable detail for the log / prompt.
+         */
+        void onRfidConnectionResult(boolean connected, String message);
     }
 
     private static final String TAG = "MYUSB_RFID";
@@ -101,6 +110,17 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     // USB-driven lifecycle entry points
     //
 
+    /**
+     * App startup -> initialize the RFID SDK and attempt to connect to an
+     * already-attached RFD40. If no reader is present / reachable, the
+     * connection-result callback reports the failure so the UI can prompt the
+     * user to turn on or attach the RFD40.
+     */
+    void startup() {
+        Log.d(TAG, "STEP: startup -> init RFID SDK + attempt connect");
+        onUsbAttached();
+    }
+
     /** ACTION_USB_DEVICE_ATTACHED -> clean up any stale session, then init SDK and connect. */
     void onUsbAttached() {
         Log.d(TAG, "STEP: onUsbAttached -> cleanup stale session + init RFID SDK + connect");
@@ -112,22 +132,61 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         // endpoint. Serialized on the single background thread, then init is
         // posted back to the main looper so the connect path runs after cleanup.
         runOnBackground(() -> {
-            disconnect();
+            if (readers != null) {
+                readers.Dispose();
+                readers = null;
+                readersAttached = false;
+            }
             mainHandler.post(this::initSdk);
         });
     }
 
     /** ACTION_USB_DEVICE_DETACHED -> stop using the reader; cleanup deferred to next attach. */
     void onUsbDetached() {
-        Log.d(TAG, "STEP: onUsbDetached -> stop (cleanup deferred to next attach)");
+        Log.d(TAG, "STEP: onUsbDetached -> stop reading (cleanup deferred to next attach)");
         resumeRequested = false;
         connectionInProgress = false;
-        // NOTE: the SDK disconnect/cleanup is intentionally NOT performed here.
-        // When the device is detached its USB endpoint is already gone, so
-        // disconnecting now makes the SDK serial IO manager fault on the dead
-        // endpoint (IOException "Queueing USB request failed" / "Receive thread
-        // interrupted"). The stale session is torn down at the start of the next
+        // The in-flight read that fails at the instant of a physical detach is
+        // logged INSIDE the SDK (RFIDSerialIOMgr: "Queueing USB request failed")
+        // tens of milliseconds before this broadcast even arrives, so that single
+        // line cannot be prevented from app code. What we can do is best-effort
+        // stop the SDK's tag-read pipeline so its serial IO manager is not left
+        // actively polling the now-dead endpoint, which keeps it to that one
+        // benign occurrence instead of cascading read errors. Every SDK call is
+        // guarded because the USB endpoint is already gone.
+        final RFIDReader detached = reader;
+        final EventHandler handler = eventHandler;
+        runOnBackground(() -> stopReaderQuietly(detached, handler));
+        // NOTE: a full reader.disconnect() is intentionally still NOT performed
+        // here; the stale session is torn down at the start of the next
         // onUsbAttached() instead.
+    }
+
+    /**
+     * Best-effort, fully-guarded stop of the SDK's event/read pipeline used on
+     * USB detach. The endpoint is already gone, so any of these calls may throw
+     * (or trigger the SDK's own serial IO error); all such failures are expected
+     * teardown noise and are swallowed here.
+     */
+    private void stopReaderQuietly(RFIDReader r, EventHandler handler) {
+        if (r == null) {
+            return;
+        }
+        try {
+            r.Events.setTagReadEvent(false);
+            r.Events.setHandheldEvent(false);
+        } catch (Exception e) {
+            Log.d(TAG, "Detach: ignoring expected error disabling events on dead endpoint: "
+                    + e.getMessage());
+        }
+        try {
+            if (handler != null) {
+                r.Events.removeEventsListener(handler);
+            }
+        } catch (Exception e) {
+            Log.d(TAG, "Detach: ignoring expected error removing listener on dead endpoint: "
+                    + e.getMessage());
+        }
     }
 
     void onDestroy() {
@@ -166,19 +225,19 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                 return;
             }
         } catch (InvalidUsageException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Failed to enumerate RFID readers", e);
             initializationInProgress = false;
             readers = null;
             readersAttached = false;
-            notifyStatus("Failed to enumerate RFID readers: " + e.getInfo());
+            notifyConnectionResult(false, "Failed to enumerate RFID readers: " + e.getInfo());
             return;
         } catch (RuntimeException e) {
             // e.g. SecurityException when BLUETOOTH_CONNECT is not granted.
-            e.printStackTrace();
+            Log.e(TAG, "RFID init error", e);
             initializationInProgress = false;
             readers = null;
             readersAttached = false;
-            notifyStatus("RFID init error: " + e.getMessage());
+            notifyConnectionResult(false, "RFID init error: " + e.getMessage());
             return;
         }
         initializationInProgress = false;
@@ -191,7 +250,7 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         if (!resumeRequested || attempt >= MAX_DISCOVERY_RETRIES) {
             initializationInProgress = false;
             if (resumeRequested) {
-                notifyStatus("No RFID readers found");
+                notifyConnectionResult(false, "No RFID readers found");
             }
             readers = null;
             readersAttached = false;
@@ -199,8 +258,8 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         }
         runOnBackground(() -> {
             try {
-                Log.d(TAG, "Retry reader discovery via RE_USB, attempt=" + attempt);
-                readers.setTransport(ENUM_TRANSPORT.RE_USB);
+                Log.d(TAG, "Retry reader discovery via SERVICE_USB, attempt=" + attempt);
+                readers.setTransport(ENUM_TRANSPORT.SERVICE_USB);
                 availableReaders = readers.GetAvailableRFIDReaderList();
                 if (availableReaders != null && !availableReaders.isEmpty()) {
                     initializationInProgress = false;
@@ -211,15 +270,15 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                     scheduleDiscoveryRetry(attempt + 1);
                 }
             } catch (InvalidUsageException e) {
-                e.printStackTrace();
+                Log.e(TAG, "Reader discovery failed", e);
                 scheduleDiscoveryRetry(attempt + 1);
             } catch (RuntimeException e) {
                 // e.g. SecurityException when BLUETOOTH_CONNECT is not granted.
-                e.printStackTrace();
+                Log.e(TAG, "RFID discovery error", e);
                 initializationInProgress = false;
                 readers = null;
                 readersAttached = false;
-                notifyStatus("RFID discovery error: " + e.getMessage());
+                notifyConnectionResult(false, "RFID discovery error: " + e.getMessage());
             }
         });
     }
@@ -234,13 +293,17 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             getAvailableReader();
             if (reader == null) {
                 connectionInProgress = false;
-                notifyStatus("No reader available to connect");
+                notifyConnectionResult(false, "No reader available to connect");
                 return;
             }
             String result = connect();
             connectionInProgress = false;
-            if (!result.isEmpty()) {
-                notifyStatus(result);
+            if (isReaderConnected()) {
+                notifyConnectionResult(true,
+                        result.isEmpty() ? "RFID Connected: " + reader.getHostName() : result);
+            } else {
+                notifyConnectionResult(false,
+                        result.isEmpty() ? "RFID connection failed" : result);
             }
         });
     }
@@ -263,10 +326,10 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             reader = list.get(0).getRFIDReader();
             Log.d(TAG, "Selected reader: " + list.get(0).getName());
         } catch (InvalidUsageException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Error looking up available readers", e);
         } catch (RuntimeException e) {
             // e.g. SecurityException when BLUETOOTH_CONNECT is not granted.
-            e.printStackTrace();
+            Log.e(TAG, "RFID reader lookup error", e);
             notifyStatus("RFID reader lookup error: " + e.getMessage());
         }
     }
@@ -287,20 +350,20 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             Log.d(TAG, "STEP: Reader Connected in " + elapsed + "ms");
             // A slow first connect means a stale session from a prior connection;
             // reconnect once to stabilize the link before configuring it.
-            // if (elapsed > SLOW_CONNECT_THRESHOLD_MS && reader.isConnected()) {
-            //     Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
-            //             + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
-            //     notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
-            //     reconnectToStabilize();
-            // }
+            if (elapsed > SLOW_CONNECT_THRESHOLD_MS && reader.isConnected()) {
+                Log.d(TAG, "STEP: Slow connect (" + elapsed + "ms > "
+                        + SLOW_CONNECT_THRESHOLD_MS + "ms); reconnecting to stabilize");
+                notifyStatus("Slow connect (" + elapsed + " ms) - reconnecting to stabilize");
+                reconnectToStabilize();
+            }
             configureReader();
             if (reader.isConnected()) {
                 return "RFID Connected: " + reader.getHostName() + " (" + elapsed + " ms)";
             }
         } catch (InvalidUsageException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Connect failed", e);
         } catch (OperationFailureException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Connect failed: " + e.getResults(), e);
             return "RFID connection failed: " + e.getResults();
         }
         return "";
@@ -312,10 +375,11 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
      * serial channel is still releasing the previous session.
      */
     private void reconnectToStabilize() throws InvalidUsageException {
-        for (int attempt = 1; attempt <= MAX_RECONNECT_RETRIES; attempt++) {
+        int attempt = 1;
+        while (true) {
             try {
                 long reStart = System.currentTimeMillis();
-                reader.reconnect();
+                reader.connect();
                 long reElapsed = System.currentTimeMillis() - reStart;
                 Log.d(TAG, "STEP: Reader Reconnected in " + reElapsed + "ms (attempt "
                         + attempt + ")");
@@ -327,11 +391,11 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                             + " failed with RFID_COMM_OPEN_ERROR; retrying");
                     notifyStatus("Reconnect attempt " + attempt
                             + " failed (COMM_OPEN_ERROR) - retrying");
+                    attempt++;
                     sleepQuietly(RECONNECT_RETRY_DELAY_MS);
                 } else {
                     Log.e(TAG, "STEP: reconnect failed after " + attempt
-                            + " attempt(s): " + e.getResults());
-                    e.printStackTrace();
+                            + " attempt(s): " + e.getResults(), e);
                     return;
                 }
             }
@@ -360,7 +424,7 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
             reader.Events.setAttachTagDataWithReadEvent(false);
             reader.Events.setReaderDisconnectEvent(true);
         } catch (InvalidUsageException | OperationFailureException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Failed to configure reader", e);
         }
     }
 
@@ -377,12 +441,12 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                 }
                 reader.disconnect();
                 reader = null;
-                notifyStatus("RFID Disconnected");
+                notifyConnectionResult(false, "RFID Disconnected");
             }
         } catch (InvalidUsageException | OperationFailureException e) {
-            e.printStackTrace();
+            Log.e(TAG, "Disconnect error", e);
         } catch (Exception e) {
-            e.printStackTrace();
+            Log.e(TAG, "Unexpected disconnect error", e);
         } finally {
             // Re-attach on the next connect attempt to avoid stale subscriptions.
             readersAttached = false;
@@ -400,7 +464,7 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
                 readersAttached = false;
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            Log.e(TAG, "Dispose error", e);
         }
         // Restore the original uncaught-exception handler.
         if (crashGuardInstalled) {
@@ -468,6 +532,13 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         }
     }
 
+    private void notifyConnectionResult(boolean connected, String message) {
+        Log.d(TAG, "Connection result: connected=" + connected + " " + message);
+        if (listener != null) {
+            mainHandler.post(() -> listener.onRfidConnectionResult(connected, message));
+        }
+    }
+
     private void runOnBackground(Runnable task) {
         try {
             backgroundExecutor.execute(task);
@@ -514,6 +585,14 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
     }
 
     private boolean isBenignSdkThreadingError(Throwable t) {
+        // Match by the SDK's well-known teardown messages first, independent of
+        // the (R8-obfuscated) stack, so the artifact is reliably swallowed across
+        // SDK builds even if the receive thread re-throws it uncaught.
+        String msg = t.getMessage();
+        if (msg != null && (msg.contains("Queueing USB request failed")
+                || msg.contains("Receive thread interrupted"))) {
+            return true;
+        }
         if (!isFromSerialInputOutputManager(t)) {
             return false;
         }
@@ -530,7 +609,6 @@ class RFIDHandler implements Readers.RFIDReaderEventHandler {
         }
         // Starting the serial IO manager twice (USB re-enumeration race) throws
         // IllegalStateException("Already running").
-        String msg = t.getMessage();
         return t instanceof IllegalStateException
                 && msg != null
                 && msg.contains("Already running");
